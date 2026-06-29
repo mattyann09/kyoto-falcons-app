@@ -19,6 +19,7 @@ import urllib.request
 
 import cv2
 import numpy as np
+import pandas as pd
 import mediapipe as mp
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision as mp_vision
@@ -81,6 +82,16 @@ def line_angle(p1, p2):
     return float(np.degrees(np.arctan2(p2[1] - p1[1], p2[0] - p1[0])))
 
 
+def normalize_angle(angle: float) -> float:
+    """角度を -180度 〜 180度 の範囲に収める(境界をまたいだ時の計算ミスを防ぐ)"""
+    return (angle + 180) % 360 - 180
+
+
+def smooth(values, window: int = 5):
+    """フレームごとの細かいノイズを移動平均で減らす(NaNがあっても安全に処理)"""
+    return pd.Series(values).rolling(window=window, center=True, min_periods=1).mean().to_numpy()
+
+
 def trunk_tilt_from_vertical(mid_hip, mid_shoulder):
     """上体(腰→肩)が、真上方向からどれだけ傾いているか(度)。0度=直立"""
     trunk = mid_shoulder - mid_hip
@@ -138,28 +149,41 @@ def extract_landmark_series(video_path: str, landmarker):
 # =============================================================================
 # バッティング解析(5項目)
 # =============================================================================
-def analyze_batting(video_path: str, batter_side: str) -> dict:
-    """batter_side: '右打者' または '左打者'"""
+def analyze_batting(
+    video_path: str,
+    batter_side: str,
+    player_height_cm: float = None,
+    bat_length_cm: float = 84.0,
+) -> dict:
+    """
+    batter_side: '右打者' または '左打者'
+    player_height_cm: 選手の身長(cm)。指定すると、バット先端の推定スピードを
+                       km/h で算出できる(指定しない場合は身長比のみ)。
+    bat_length_cm: バットの長さ(cm)。デフォルトは一般的な84cm。
+    """
     landmarker = load_landmarker()
     frames, fps, w, h = extract_landmark_series(video_path, landmarker)
 
-    lead = "L" if batter_side == "右打者" else "R"  # リード側(投手側)の腕
+    lead = "L" if batter_side == "右打者" else "R"   # リード側(投手側)の腕
+    trail = "R" if batter_side == "右打者" else "L"  # トレイル側(後ろ側)の腕
 
-    hip_x_list, wrist_speed_list = [], []
+    hip_x_list = []
+    wrist_x_list, wrist_y_list = [], []
+    shoulder_x_list, shoulder_y_list = [], []
     ankle_dist_list, body_height_list = [], []
-    lead_elbow_angle_list, sep_angle_list = [], []
-
-    prev_mid_wrist = None
+    trail_elbow_angle_list, sep_angle_list = [], []
 
     for lm in frames:
         if lm is None:
             hip_x_list.append(np.nan)
-            wrist_speed_list.append(np.nan)
+            wrist_x_list.append(np.nan)
+            wrist_y_list.append(np.nan)
+            shoulder_x_list.append(np.nan)
+            shoulder_y_list.append(np.nan)
             ankle_dist_list.append(np.nan)
             body_height_list.append(np.nan)
-            lead_elbow_angle_list.append(np.nan)
+            trail_elbow_angle_list.append(np.nan)
             sep_angle_list.append(np.nan)
-            prev_mid_wrist = None
             continue
 
         l_sh, r_sh = xy(lm, LEFT_SHOULDER, w, h), xy(lm, RIGHT_SHOULDER, w, h)
@@ -171,45 +195,100 @@ def analyze_batting(video_path: str, batter_side: str) -> dict:
 
         mid_hip = (l_hip + r_hip) / 2
         mid_wrist = (l_wr + r_wr) / 2
+        mid_shoulder = (l_sh + r_sh) / 2
         mid_ankle = (l_an + r_an) / 2
 
         hip_x_list.append(mid_hip[0])
+        wrist_x_list.append(mid_wrist[0])
+        wrist_y_list.append(mid_wrist[1])
+        shoulder_x_list.append(mid_shoulder[0])
+        shoulder_y_list.append(mid_shoulder[1])
         ankle_dist_list.append(np.linalg.norm(l_an - r_an))
         body_height_list.append(np.linalg.norm(nose - mid_ankle))
-        sep_angle_list.append(line_angle(l_sh, r_sh) - line_angle(l_hip, r_hip))
+        sep_angle_list.append(normalize_angle(line_angle(l_sh, r_sh) - line_angle(l_hip, r_hip)))
 
-        if lead == "L":
-            lead_elbow_angle_list.append(joint_angle(l_sh, l_el, l_wr))
+        if trail == "L":
+            trail_elbow_angle_list.append(joint_angle(l_sh, l_el, l_wr))
         else:
-            lead_elbow_angle_list.append(joint_angle(r_sh, r_el, r_wr))
+            trail_elbow_angle_list.append(joint_angle(r_sh, r_el, r_wr))
 
-        if prev_mid_wrist is not None:
-            wrist_speed_list.append(np.linalg.norm(mid_wrist - prev_mid_wrist) * fps)
-        else:
-            wrist_speed_list.append(np.nan)
-        prev_mid_wrist = mid_wrist
-
-    hip_x = np.array(hip_x_list)
-    wrist_speed = np.array(wrist_speed_list)
-    ankle_dist = np.array(ankle_dist_list)
+    hip_x = smooth(np.array(hip_x_list))
+    ankle_dist = smooth(np.array(ankle_dist_list))
     body_height = np.array(body_height_list)
-    lead_elbow_angle = np.array(lead_elbow_angle_list)
-    sep_angle = np.array(sep_angle_list)
+    trail_elbow_angle = smooth(np.array(trail_elbow_angle_list))
+    sep_angle = smooth(np.array(sep_angle_list))
+
+    # 先に位置のノイズを軽く減らし、そこから速度を計算する
+    wrist_x = smooth(np.array(wrist_x_list), window=3)
+    wrist_y = smooth(np.array(wrist_y_list), window=3)
+    shoulder_x = smooth(np.array(shoulder_x_list), window=3)
+    shoulder_y = smooth(np.array(shoulder_y_list), window=3)
 
     body_height_ref = np.nanmedian(body_height)
 
-    # インパクトの瞬間 ≒ 手首スピードが最大になったフレーム、で近似する
-    impact_idx = int(np.nanargmax(wrist_speed))
+    # ---------------------------------------------------------------------
+    # バット先端の推定スピード
+    # 「肩を中心に、手首とバットが回転している」と見立てて、
+    # 回転の速さ(角速度) × (肩〜手首の距離 + バットの長さ) で
+    # バット先端の速度を近似する。
+    # ---------------------------------------------------------------------
+    radius_x = wrist_x - shoulder_x
+    radius_y = wrist_y - shoulder_y
+    radius_len_px = np.sqrt(radius_x**2 + radius_y**2)
+
+    angle_rad = np.arctan2(radius_y, radius_x)
+    angle_rad_unwrapped = np.unwrap(np.nan_to_num(angle_rad, nan=0.0))
+    angle_rad_unwrapped[np.isnan(angle_rad)] = np.nan
+    angular_velocity = np.diff(angle_rad_unwrapped, prepend=np.nan) * fps  # rad/s
+
+    if player_height_cm and player_height_cm > 0:
+        px_per_cm = body_height_ref / player_height_cm
+        bat_length_px = bat_length_cm * px_per_cm
+        bat_tip_radius_px = radius_len_px + bat_length_px
+        bat_tip_speed_px_s = np.abs(angular_velocity) * bat_tip_radius_px
+        bat_tip_speed_cm_s = bat_tip_speed_px_s / px_per_cm
+        bat_speed_kmh = bat_tip_speed_cm_s * 3600 / 100000
+        bat_speed_label = "バット先端推定スピード(km/h)"
+        bat_speed_value = float(np.nanmax(bat_speed_kmh))
+        bat_speed_series = bat_speed_kmh
+    else:
+        # 身長未入力の場合は、参考値として身長比のスピードを返す
+        bat_tip_radius_px = radius_len_px + (bat_length_cm / 170 * body_height_ref)  # 大まかな比率で代用
+        bat_tip_speed_px_s = np.abs(angular_velocity) * bat_tip_radius_px
+        bat_speed_label = "バット先端推定スピード(身長/秒、参考値)"
+        bat_speed_value = float(np.nanmax(bat_tip_speed_px_s) / body_height_ref)
+        bat_speed_series = bat_tip_speed_px_s / body_height_ref
+
+    # インパクトの瞬間 ≒ バット先端スピードが最大になったフレーム、で近似する
+    impact_idx = int(np.nanargmax(bat_tip_speed_px_s))
     # 着地(ステップ)の瞬間 ≒ 両足の間隔が最大になったフレーム、で近似する
     footplant_idx = int(np.nanargmax(ankle_dist))
 
-    return {
+    result = {
         "体重移動量(身長比)": float((np.nanmax(hip_x) - np.nanmin(hip_x)) / body_height_ref),
         "腰肩捻れ最大角度(度)": float(np.nanmax(np.abs(sep_angle))),
-        "インパクト時リード肘角度(度)": float(lead_elbow_angle[impact_idx]),
-        "手首最大スピード(身長/秒)": float(np.nanmax(wrist_speed) / body_height_ref),
+        "インパクト時トレイル肘角度(度)": float(trail_elbow_angle[impact_idx]),
+        bat_speed_label: bat_speed_value,
         "ステップ幅(身長比)": float(ankle_dist[footplant_idx] / body_height_ref),
     }
+
+    # 確認画面でグラフ表示するための、フレームごとの時系列データ
+    valid_hip_x = hip_x[~np.isnan(hip_x)]
+    hip_x_baseline = valid_hip_x[0] if len(valid_hip_x) > 0 else 0
+    hip_movement = (hip_x - hip_x_baseline) / body_height_ref
+    stride_ratio = ankle_dist / body_height_ref
+
+    time_s = np.arange(len(hip_x)) / fps
+    timeseries = pd.DataFrame(
+        {
+            "time_s": time_s,
+            "体重移動(開始位置からの移動, 身長比)": hip_movement,
+            "腰肩捻れ角度(度)": sep_angle,
+            "足の間隔(身長比)": stride_ratio,
+        }
+    )
+
+    return result, timeseries
 
 
 # =============================================================================
@@ -226,9 +305,7 @@ def analyze_pitching(video_path: str, pitcher_arm: str) -> dict:
     ankle_dist_list, body_height_list = [], []
     sep_angle_list, elbow_height_list = [], []
     knee_angle_land_list, trunk_tilt_list = [], []
-    throw_wrist_speed_list = []
-
-    prev_throw_wrist = None
+    throw_wrist_x_list, throw_wrist_y_list = [], []
 
     for lm in frames:
         if lm is None:
@@ -238,8 +315,8 @@ def analyze_pitching(video_path: str, pitcher_arm: str) -> dict:
             elbow_height_list.append(np.nan)
             knee_angle_land_list.append(np.nan)
             trunk_tilt_list.append(np.nan)
-            throw_wrist_speed_list.append(np.nan)
-            prev_throw_wrist = None
+            throw_wrist_x_list.append(np.nan)
+            throw_wrist_y_list.append(np.nan)
             continue
 
         l_sh, r_sh = xy(lm, LEFT_SHOULDER, w, h), xy(lm, RIGHT_SHOULDER, w, h)
@@ -256,7 +333,7 @@ def analyze_pitching(video_path: str, pitcher_arm: str) -> dict:
 
         ankle_dist_list.append(np.linalg.norm(l_an - r_an))
         body_height_list.append(np.linalg.norm(nose - mid_ankle))
-        sep_angle_list.append(line_angle(l_sh, r_sh) - line_angle(l_hip, r_hip))
+        sep_angle_list.append(normalize_angle(line_angle(l_sh, r_sh) - line_angle(l_hip, r_hip)))
         trunk_tilt_list.append(trunk_tilt_from_vertical(mid_hip, mid_shoulder))
 
         if throw == "R":
@@ -264,25 +341,27 @@ def analyze_pitching(video_path: str, pitcher_arm: str) -> dict:
         else:
             throw_shoulder, throw_elbow, throw_wrist = l_sh, l_el, l_wr
         elbow_height_list.append(throw_shoulder[1] - throw_elbow[1])  # +なら肘が肩より上
+        throw_wrist_x_list.append(throw_wrist[0])
+        throw_wrist_y_list.append(throw_wrist[1])
 
         if land == "L":
             knee_angle_land_list.append(joint_angle(l_hip, l_kn, l_an))
         else:
             knee_angle_land_list.append(joint_angle(r_hip, r_kn, r_an))
 
-        if prev_throw_wrist is not None:
-            throw_wrist_speed_list.append(np.linalg.norm(throw_wrist - prev_throw_wrist) * fps)
-        else:
-            throw_wrist_speed_list.append(np.nan)
-        prev_throw_wrist = throw_wrist
-
-    ankle_dist = np.array(ankle_dist_list)
+    ankle_dist = smooth(np.array(ankle_dist_list))
     body_height = np.array(body_height_list)
-    sep_angle = np.array(sep_angle_list)
-    elbow_height = np.array(elbow_height_list)
-    knee_angle_land = np.array(knee_angle_land_list)
-    trunk_tilt = np.array(trunk_tilt_list)
-    throw_wrist_speed = np.array(throw_wrist_speed_list)
+    sep_angle = smooth(np.array(sep_angle_list))
+    elbow_height = smooth(np.array(elbow_height_list))
+    knee_angle_land = smooth(np.array(knee_angle_land_list))
+    trunk_tilt = smooth(np.array(trunk_tilt_list))
+
+    # 先に位置のノイズを軽く減らし、そこから速度を計算する
+    throw_wrist_x = smooth(np.array(throw_wrist_x_list), window=3)
+    throw_wrist_y = smooth(np.array(throw_wrist_y_list), window=3)
+    dx = np.diff(throw_wrist_x, prepend=np.nan)
+    dy = np.diff(throw_wrist_y, prepend=np.nan)
+    throw_wrist_speed = np.sqrt(dx**2 + dy**2) * fps
 
     body_height_ref = np.nanmedian(body_height)
 
@@ -291,13 +370,28 @@ def analyze_pitching(video_path: str, pitcher_arm: str) -> dict:
     # リリースの瞬間 ≒ 投げる側の手首スピードが最大になったフレーム、で近似する
     release_idx = int(np.nanargmax(throw_wrist_speed))
 
-    return {
+    result = {
         "ステップ幅(身長比)": float(ankle_dist[footplant_idx] / body_height_ref),
         "着地時腰肩捻れ角度(度)": float(sep_angle[footplant_idx]),
         "着地時肘高さ(身長比)": float(elbow_height[footplant_idx] / body_height_ref),
         "リリース時上体前傾角度(度)": float(trunk_tilt[release_idx]),
-        "着地脚膝角度(度)": float(knee_angle_land[footplant_idx]),
+        "着地脚膝伸展量(度)": float(knee_angle_land[release_idx] - knee_angle_land[footplant_idx]),
     }
+
+    # 確認画面でグラフ表示するための、フレームごとの時系列データ
+    stride_ratio = ankle_dist / body_height_ref
+
+    time_s = np.arange(len(ankle_dist)) / fps
+    timeseries = pd.DataFrame(
+        {
+            "time_s": time_s,
+            "腰肩捻れ角度(度)": sep_angle,
+            "着地脚膝角度(度)": knee_angle_land,
+            "足の間隔(身長比)": stride_ratio,
+        }
+    )
+
+    return result, timeseries
 
 
 # =============================================================================
@@ -306,16 +400,17 @@ def analyze_pitching(video_path: str, pitcher_arm: str) -> dict:
 if __name__ == "__main__":
     if len(sys.argv) < 4:
         print("使い方:")
-        print("  python analysis_engine.py 動画のパス batting 右打者")
+        print("  python analysis_engine.py 動画のパス batting 右打者 [身長cm]")
         print("  python analysis_engine.py 動画のパス pitching 右投げ")
         sys.exit(1)
 
     video_path, mode, side = sys.argv[1], sys.argv[2], sys.argv[3]
 
     if mode == "batting":
-        result = analyze_batting(video_path, side)
+        height = float(sys.argv[4]) if len(sys.argv) > 4 else None
+        result, timeseries = analyze_batting(video_path, side, player_height_cm=height)
     elif mode == "pitching":
-        result = analyze_pitching(video_path, side)
+        result, timeseries = analyze_pitching(video_path, side)
     else:
         print("2番目の引数は batting か pitching にしてください")
         sys.exit(1)

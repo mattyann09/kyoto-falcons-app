@@ -2,6 +2,8 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 
+from badges import check_and_show_badges
+
 st.set_page_config(page_title="成績を見る - 京都ファルコンズ", page_icon="📊", layout="wide")
 
 # =============================================================================
@@ -173,6 +175,35 @@ def render_player_detail(player_name: str, row: pd.Series):
         st.rerun()
 
 
+def render_badge_banner():
+    """最新年度の打者・投手の記録を確認し、節目を達成していたら横長バナーで表示する"""
+    latest_year = max(YEAR_SHEET_MAP.keys())
+    session_key = f"badge_messages_{latest_year}"
+
+    refresh_col, _ = st.columns([1, 5])
+    with refresh_col:
+        if st.button("🔄 記録を再確認"):
+            st.session_state.pop(session_key, None)
+            st.cache_data.clear()
+            st.rerun()
+
+    if session_key not in st.session_state:
+        messages = []
+        for tab_choice, section_keyword in [("打者", "野手"), ("投手", "投手")]:
+            try:
+                sheet_info = YEAR_SHEET_MAP[latest_year]
+                raw = load_raw_sheet(sheet_url(sheet_info["spreadsheet_id"], sheet_info["gid"]))
+                df, _team_row = extract_table(raw, section_keyword)
+                df = coerce_numeric(df)
+                messages.extend(check_and_show_badges(df, tab_choice))
+            except Exception as e:
+                st.warning(f"⚠️ バッジ機能でエラー({tab_choice}): {e}")
+        st.session_state[session_key] = messages
+
+    for msg in st.session_state[session_key]:
+        st.success(f"🎉 {msg}")
+
+
 # -----------------------------------------------------------------------------
 # 個人成績一覧(打者/投手タブ切り替え)
 # -----------------------------------------------------------------------------
@@ -245,6 +276,7 @@ def render_stats_view():
 # メイン処理
 # -----------------------------------------------------------------------------
 render_header()
+render_badge_banner()
 
 if "selected_player" not in st.session_state:
     st.session_state.selected_player = None
